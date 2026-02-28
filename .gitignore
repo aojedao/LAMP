@@ -1,0 +1,23 @@
+# Virtual environments
+env/
+venv/
+.venv/
+yolo_env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# YOLO model weights (large binary)
+*.pt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
