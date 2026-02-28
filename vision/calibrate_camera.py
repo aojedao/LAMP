@@ -37,6 +37,8 @@ import cv2
 import numpy as np
 import json
 import argparse
+import time
+import glob
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION  — matches your physical board
@@ -126,21 +128,75 @@ def save_calibration(camera_matrix, dist_coeffs, frame_size, reprojection_error)
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
-def scan_cameras(max_index=10):
-    """Return a list of (index, width, height) for every camera that can be opened."""
+def scan_cameras():
+    """Return a list of (device_path, width, height) for real capture cameras.
+    Scans /dev/videoX paths directly via V4L2 to avoid integer-index confusion
+    between OpenCV backends.  Metadata-only nodes are filtered out by requiring
+    a non-black frame after a short warm-up."""
+    devices = sorted(glob.glob("/dev/video*"))
+
+    prev_log = cv2.setLogLevel(0) if hasattr(cv2, 'setLogLevel') else None
     found = []
-    for idx in range(max_index):
-        cap = cv2.VideoCapture(idx)
+    for dev in devices:
+        v4l2_idx = _v4l2_index(dev)
+        cap = cv2.VideoCapture(v4l2_idx, cv2.CAP_V4L2)
         if not cap.isOpened():
-            cap.release()
             continue
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Warm up — some sensors return black frames initially
+        frame = None
+        for _ in range(10):
+            ret, f = cap.read()
+            if ret and f is not None and f.size > 0 and f.max() >= 5:
+                frame = f
+                break
         cap.release()
-        found.append((idx, w, h))
+        if frame is None:
+            continue
+        w = frame.shape[1]
+        h = frame.shape[0]
+        found.append((dev, w, h))
+    if prev_log is not None:
+        cv2.setLogLevel(prev_log)
     return found
+
+
+def _v4l2_index(dev):
+    """Convert '/dev/video2' or 2 to the integer 2 needed by CAP_V4L2."""
+    if isinstance(dev, int):
+        return dev
+    # Extract trailing digits: '/dev/video2' → 2
+    digits = ''.join(filter(str.isdigit, str(dev).split('/')[-1]))
+    if digits:
+        return int(digits)
+    raise RuntimeError(f"Cannot derive V4L2 index from '{dev}'")
+
+
+def open_camera(idx):
+    """Open a camera by integer index or device path string and return the
+    VideoCapture object.  Accepts both 2 and '/dev/video2'.
+    Forces V4L2 + MJPEG so 640x480@30fps works correctly."""
+    v4l2_idx = _v4l2_index(idx)
+    cap = cv2.VideoCapture(v4l2_idx, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(v4l2_idx)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open camera '{idx}'.")
+    # Must set MJPEG *before* width/height so the driver negotiates correctly
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    # Keep only the most recent frame — avoids stale-buffer black frames
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    # Drain warm-up frames (some sensors take ~10 frames to start exposing)
+    for _ in range(20):
+        cap.grab()
+    return cap
 
 
 def pick_camera(cameras):
@@ -148,14 +204,13 @@ def pick_camera(cameras):
     if not cameras:
         raise RuntimeError("No cameras detected.")
     if len(cameras) == 1:
-        idx, w, h = cameras[0]
-        print(f"[CAM] Only one camera found — using index {idx} ({w}x{h})")
-        return idx
+        dev, w, h = cameras[0]
+        print(f"[CAM] Only one camera found — using {dev} ({w}x{h})")
+        return dev
 
     print("\n[CAM] Multiple cameras detected:")
-    for i, (idx, w, h) in enumerate(cameras):
-        label = "(likely laptop webcam)" if idx == 0 else "(likely external / robot cam)"
-        print(f"  {i+1})  index {idx}  —  {w}x{h}  {label}")
+    for i, (dev, w, h) in enumerate(cameras):
+        print(f"  {i+1})  {dev}  —  {w}x{h}")
 
     while True:
         try:
@@ -169,25 +224,29 @@ def pick_camera(cameras):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--camera", type=int, default=None,
-                        help="Camera index — skip auto-detection and use this directly")
+    parser.add_argument("--camera", type=str, default=None,
+                        help="Camera index or device path (e.g. 2 or /dev/video2) — "
+                             "skip auto-detection")
     args = parser.parse_args()
 
     # ── Pick camera ───────────────────────────────────────────────────────────
     if args.camera is not None:
-        cam_idx = args.camera
-        print(f"[CAM] Using camera index {cam_idx} (from --camera flag)")
+        # Accept both integer index and device path string
+        try:
+            cam_idx = int(args.camera)
+        except ValueError:
+            cam_idx = args.camera   # e.g. '/dev/video2'
+        print(f"[CAM] Using camera '{cam_idx}' (from --camera flag)")
+        cap = open_camera(cam_idx)
     else:
         print("[CAM] Scanning for available cameras ...")
         cameras = scan_cameras()
         cam_idx = pick_camera(cameras)
+        cap = open_camera(cam_idx)
 
-    cap = cv2.VideoCapture(cam_idx)
     if not cap.isOpened():
-        raise RuntimeError(f"Cannot open camera at index {cam_idx}.")
+        raise RuntimeError(f"Cannot open camera {cam_idx}.")
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_size = (w, h)
@@ -209,8 +268,10 @@ def main():
     force_save     = False
 
     while True:
-        ret, frame = cap.read()
-        if not ret:
+        # grab() discards the oldest buffered frame; retrieve() gives the latest
+        cap.grab()
+        ret, frame = cap.retrieve()
+        if not ret or frame is None or frame.size == 0:
             continue
 
         gray         = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)

@@ -22,8 +22,8 @@ Prerequisites
 
 Usage
 -----
-python calibrate_workspace.py                # auto-detect camera
-python calibrate_workspace.py --camera 1     # force camera index
+python calibrate_workspace.py                      # auto-detect camera
+python calibrate_workspace.py --camera /dev/video2  # force device path
 
 Output
 ------
@@ -34,6 +34,7 @@ import cv2
 import cv2.aruco
 import numpy as np
 import json
+import glob
 import argparse
 import os
 
@@ -75,11 +76,11 @@ def load_camera_calibration():
     return cam_matrix, dist_coeffs
 
 
-def scan_cameras(max_index=10):
-    """Return a list of (index, width, height) for every camera that can be opened."""
+def scan_cameras():
+    """Return list of (path, width, height) for usable /dev/videoX nodes."""
     found = []
-    for idx in range(max_index):
-        cap = cv2.VideoCapture(idx)
+    for path in sorted(glob.glob("/dev/video*")):
+        cap = cv2.VideoCapture(path)
         if not cap.isOpened():
             cap.release()
             continue
@@ -88,23 +89,24 @@ def scan_cameras(max_index=10):
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         cap.release()
-        found.append((idx, w, h))
+        if w > 0 and h > 0:
+            found.append((path, w, h))
     return found
 
 
 def pick_camera(cameras):
     """Let the user choose when multiple cameras are available."""
     if not cameras:
-        raise RuntimeError("No cameras detected.")
+        raise RuntimeError("No video devices found under /dev/video*")
     if len(cameras) == 1:
-        idx, w, h = cameras[0]
-        print(f"[CAM] Only one camera found — using index {idx} ({w}x{h})")
-        return idx
+        path, w, h = cameras[0]
+        print(f"[CAM] Only one device found: {path} ({w}x{h})")
+        return path
 
-    print("\n[CAM] Multiple cameras detected:")
-    for i, (idx, w, h) in enumerate(cameras):
-        label = "(likely laptop webcam)" if idx == 0 else "(likely external / robot cam)"
-        print(f"  {i+1})  index {idx}  —  {w}x{h}  {label}")
+    print("\n[CAM] Available cameras:")
+    for i, (path, w, h) in enumerate(cameras):
+        note = "(built-in webcam)" if path == "/dev/video0" else "(external / robot cam)"
+        print(f"  {i+1})  {path}  {w}x{h}  {note}")
 
     while True:
         try:
@@ -127,27 +129,27 @@ def marker_centre(corner):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--camera", type=int, default=None,
-                        help="Camera index — skip auto-detection and use this directly")
+    parser.add_argument("--camera", default=None,
+                        help="Device path, e.g. /dev/video2")
     args = parser.parse_args()
 
     # ── Camera ────────────────────────────────────────────────────────────────
     if args.camera is not None:
-        cam_idx = args.camera
-        print(f"[CAM] Using camera index {cam_idx} (from --camera flag)")
+        cam_path = args.camera
+        print(f"[CAM] Using {cam_path} (from --camera flag)")
     else:
-        print("[CAM] Scanning for available cameras ...")
-        cameras = scan_cameras()
-        cam_idx = pick_camera(cameras)
+        print("[CAM] Scanning /dev/video* ...")
+        cameras  = scan_cameras()
+        cam_path = pick_camera(cameras)
 
-    cap = cv2.VideoCapture(cam_idx)
+    cap = cv2.VideoCapture(cam_path)
     if not cap.isOpened():
-        raise RuntimeError(f"Cannot open camera at index {cam_idx}.")
+        raise RuntimeError(f"Cannot open {cam_path}")
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"[CAM] Opened camera {cam_idx} at {w}x{h}")
+    print(f"[CAM] Opened {cam_path} at {w}x{h}")
 
     # ── Camera calibration (optional, for undistortion) ───────────────────────
     cam_matrix, dist_coeffs = load_camera_calibration()

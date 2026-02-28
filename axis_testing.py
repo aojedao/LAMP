@@ -27,7 +27,7 @@ relative to the initial (home) position. The robot:
 Ctrl+C at any time triggers an immediate return to home.
 
 Example:
-    python axis_testing.py --port /dev/ttyACM0 --id my_lamp --urdf-path /path/to/so100.urdf --axis x --range-start -0.1 --range-end 0.1 --duration 4.0
+    python axis_testing.py --port /dev/ttyACM0 --id my_lamp --urdf-path /home/aojedao/Documents/NYU/ITP/SO-ARM100/Simulation/SO100/so100.urdf --axis x --range-start -0.1 --range-end 0.1 --duration 4.0
 """
 
 import argparse
