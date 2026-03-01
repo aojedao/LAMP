@@ -15,6 +15,8 @@ Usage
 python main.py               # auto-detects robot camera, else falls back to webcam
 python main.py --webcam      # force laptop webcam (for testing YOLO only)
 python main.py --camera 2    # manually pick a camera index
+
+#did manual setup to callibrate camera and workspace.
 """
 
 import sys
