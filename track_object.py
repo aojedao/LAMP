@@ -1,29 +1,22 @@
+#!/usr/bin/env python
 """
-Book / Object Detection — YOLO11n  (V2: full 3D world coordinates)
-===================================================================
-Camera  : SO-100 robot camera (UVC), falls back to laptop webcam
-Model   : yolo11n.pt
-Output  : Real-world (X, Y, Z) in metres, ready for move_to_3d_location.py
-
-Coordinate system
------------------
-  X  — workspace horizontal (metres from left ArUco marker edge)
-  Y  — workspace vertical   (metres from top  ArUco marker edge)
-  Z  — height above workspace surface (metres, estimated from depth)
-
-  X and Y are computed via the homography in workspace_calibration.json.
-  Z is estimated with the pinhole formula:
-      Z = (known_object_width_m × fx) / bbox_width_px
+track_object.py — YOLO Object Detection + SO-100 Arm Tracking
+==============================================================
+Built directly on main_v2.py (single-threaded loop, same camera
+open sequence).  Arm control is added inline; if loading fails
+the script continues as a plain vision tool.
 
 Usage
 -----
-python main_v2.py                        # auto-detect camera
-python main_v2.py --webcam              # force laptop webcam
-python main_v2.py --camera /dev/video2  # pick device path manually
+# Vision only
+python track_object.py --camera /dev/video2
 
-Install
--------
-pip install numpy opencv-python ultralytics
+# Full arm tracking
+python track_object.py \
+    --camera    /dev/video2 \
+    --port      /dev/ttyACM0 \
+    --id        my_lamp \
+    --urdf-path ~/Documents/NYU/ITP/SO-ARM100/Simulation/SO100/so100.urdf
 """
 
 import sys
@@ -35,30 +28,32 @@ import glob
 import numpy as np
 import cv2
 from ultralytics import YOLO
-import cv2.aruco
+from pathlib import Path
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-MODEL_PATH        = "yolo11n.pt"
-CONFIDENCE_THRESH = 0.40
+# Resolved relative to THIS file (LAMP root), not vision/
+_DIR                 = os.path.dirname(os.path.abspath(__file__))
+VISION_DIR           = os.path.join(_DIR, "vision")
+MODEL_PATH           = os.path.join(VISION_DIR, "yolo11n.pt")
+CAMERA_CALIB_FILE    = os.path.join(VISION_DIR, "camera_calibration.json")
+WORKSPACE_CALIB_FILE = os.path.join(VISION_DIR, "workspace_calibration.json")
 
-ROBOT_CAM_WIDTH   = 640
-ROBOT_CAM_HEIGHT  = 480
+ROBOT_CAM_WIDTH  = 640
+ROBOT_CAM_HEIGHT = 480
 
 ZOOM_DEFAULT = 1.0
 ZOOM_MIN     = 1.0
 ZOOM_MAX     = 5.0
 ZOOM_STEP    = 0.25
 
-# Real-world widths for depth (Z) estimation.
-# All keys here are also the detectable object classes.
 OBJECT_WIDTHS_M = {
-    "book":       0.21,    # standard paperback / A4
-    "bottle":     0.07,    # standard 500 ml bottle
-    "cell phone": 0.075,   # typical smartphone
+    "book":       0.21,
+    "bottle":     0.07,
+    "cell phone": 0.075,
     "cup":        0.08,
     "remote":     0.05,
     "keyboard":   0.38,
@@ -67,26 +62,28 @@ OBJECT_WIDTHS_M = {
     "vase":       0.12,
     "bowl":       0.15,
 }
-FALLBACK_WIDTH_M  = 0.15
-FOCAL_LENGTH_PX   = 600.0   # overridden by camera_calibration.json
+FALLBACK_WIDTH_M        = 0.15
+FOCAL_LENGTH_PX         = 600.0
+GRIPPER_APPROACH_Z_OFFSET = 0.05   # metres above workspace surface
 
-# Fixed gripper approach height above the detected object surface (metres)
-# The arm will aim for the object centre + this offset so the gripper
-# clears the surface before descending.
-GRIPPER_APPROACH_Z_OFFSET = 0.05   # 5 cm above estimated surface
-
-# Calibration files — resolved relative to this script's directory
-_DIR                 = os.path.dirname(os.path.abspath(__file__))
-CAMERA_CALIB_FILE    = os.path.join(_DIR, "camera_calibration.json")
-WORKSPACE_CALIB_FILE = os.path.join(_DIR, "workspace_calibration.json")
+# Frame-rotation matrices for arm coordinate transform
+FRAME_R_DISPLAY_TO_RAW = np.array([
+    [-0.2702471023729073, -0.8897091717756613,  0.367945774968696   ],
+    [-0.5045256680845093,  0.4563583697590681,  0.7329330723843245  ],
+    [ 0.8200124108224991, -0.012434951110182071, 0.5722106413620428 ],
+])
+FRAME_R_RAW_TO_DISPLAY = np.array([
+    [-0.2702471023729073, -0.5045256680845093,  0.8200124108224991  ],
+    [-0.8897091717756613,  0.4563583697590681, -0.012434951110182071],
+    [ 0.367945774968696,   0.7329330723843245,  0.5722106413620428  ],
+])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CALIBRATION LOADERS
+#  CALIBRATION LOADERS  (verbatim from main_v2.py)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_camera_calibration():
-    """Returns (cam_matrix, dist_coeffs, fx) or (None, None, FOCAL_LENGTH_PX)."""
     if not os.path.exists(CAMERA_CALIB_FILE):
         print(f"[CALIB] {CAMERA_CALIB_FILE} not found — using default fx={FOCAL_LENGTH_PX}")
         return None, None, FOCAL_LENGTH_PX
@@ -100,7 +97,6 @@ def load_camera_calibration():
 
 
 def load_workspace_calibration():
-    """Returns (pixel_polygon, homography, workspace_wh_m) or (None, None, None)."""
     if not os.path.exists(WORKSPACE_CALIB_FILE):
         print(f"[CALIB] {WORKSPACE_CALIB_FILE} not found — workspace mapping DISABLED.")
         return None, None, None
@@ -108,27 +104,20 @@ def load_workspace_calibration():
         data = json.load(f)
     pixel_poly = np.array(data["pixel_corners"], dtype=np.float32)
     homography = np.array(data["homography"],    dtype=np.float64)
-    ws_m       = data["workspace_m"]              # [width_m, height_m]
+    ws_m       = data["workspace_m"]
     print(f"[CALIB] Workspace loaded — "
-          f"{ws_m[0]*100:.0f} cm × {ws_m[1]*100:.0f} cm  "
-          f"(homography ready)")
+          f"{ws_m[0]*100:.0f} cm x {ws_m[1]*100:.0f} cm  (homography ready)")
     return pixel_poly.reshape(-1, 1, 2).astype(np.int32), homography, ws_m
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CAMERA
+#  CAMERA  (verbatim from main_v2.py)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def find_video_devices():
-    """Return list of (path, w, h) for all usable /dev/videoX nodes.
-    Skips metadata nodes (e.g. /dev/video1, /dev/video3) by verifying
-    that an actual frame can be grabbed.
-    """
     found = []
     for path in sorted(glob.glob("/dev/video*")):
-        digits = ''.join(filter(str.isdigit, str(path).split('/')[-1]))
-        idx = int(digits) if digits else 0
-        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        cap = cv2.VideoCapture(path)
         if not cap.isOpened():
             cap.release()
             continue
@@ -136,16 +125,13 @@ def find_video_devices():
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, ROBOT_CAM_HEIGHT)
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        # Attempt a real grab to filter out metadata-only nodes
-        ok = cap.grab()
         cap.release()
-        if w > 0 and h > 0 and ok:
+        if w > 0 and h > 0:
             found.append((path, w, h))
     return found
 
 
 def find_robot_camera():
-    """Return path of first non-/dev/video0 device, or None."""
     print("[CAM] Scanning /dev/video* for robot camera ...")
     for path, w, h in find_video_devices():
         if path != "/dev/video0":
@@ -156,7 +142,6 @@ def find_robot_camera():
 
 
 def open_camera(path, robot_mode):
-    # Derive integer index from path (e.g. /dev/video2 -> 2)
     digits = ''.join(filter(str.isdigit, str(path).split('/')[-1]))
     idx = int(digits) if digits else 0
 
@@ -171,7 +156,6 @@ def open_camera(path, robot_mode):
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, ROBOT_CAM_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, 30)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    # Warm up — flush stale buffered frames
     for _ in range(20):
         cap.grab()
 
@@ -183,25 +167,15 @@ def open_camera(path, robot_mode):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  3D COORDINATE COMPUTATION
+#  3D COORDINATE HELPERS  (verbatim from main_v2.py)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def pixel_to_world_xy(px, py, homography):
-    """
-    Apply the workspace homography to map a pixel (px, py)
-    to real-world (X, Y) in metres on the table surface.
-    """
-    pt_h   = homography @ np.array([px, py, 1.0], dtype=np.float64)
-    X_world = pt_h[0] / pt_h[2]
-    Y_world = pt_h[1] / pt_h[2]
-    return float(X_world), float(Y_world)
+    pt_h = homography @ np.array([px, py, 1.0], dtype=np.float64)
+    return float(pt_h[0] / pt_h[2]), float(pt_h[1] / pt_h[2])
 
 
 def estimate_z(bbox_width_px, class_name, fx):
-    """
-    Pinhole depth estimate:  Z = (real_width_m × fx) / bbox_width_px
-    Returns height above the camera (metres).
-    """
     if bbox_width_px < 1:
         return float("inf")
     real_w = OBJECT_WIDTHS_M.get(class_name, FALLBACK_WIDTH_M)
@@ -211,10 +185,6 @@ def estimate_z(bbox_width_px, class_name, fx):
 def is_inside_workspace(px, py, polygon):
     return cv2.pointPolygonTest(polygon, (float(px), float(py)), False) >= 0
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  VISION HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
 
 def crop_zoom(frame, zoom):
     if zoom <= 1.0:
@@ -227,75 +197,94 @@ def crop_zoom(frame, zoom):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ARM BRIDGE
+#  ARM HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def send_to_arm(x_m, y_m, z_m):
-    """
-    Called every frame a valid in-workspace object is detected.
+def get_current_ee_pos(kinematics, joints):
+    T = kinematics.forward_kinematics(joints)
+    return FRAME_R_RAW_TO_DISPLAY @ T[:3, 3]
 
-    Args
-    ----
-    x_m  — workspace X in metres (from left ArUco edge)
-    y_m  — workspace Y in metres (from top  ArUco edge)
-    z_m  — height above workspace surface in metres
 
-    Replace the body with your arm control call, e.g.:
+def ik_step(kinematics, joints, target_disp, ee_rot):
+    target_raw = FRAME_R_DISPLAY_TO_RAW @ target_disp
+    pose = np.eye(4, dtype=float)
+    pose[:3, :3] = ee_rot
+    pose[:3, 3]  = target_raw
+    try:
+        return kinematics.inverse_kinematics(
+            joints, pose,
+            position_weight=10.0,
+            orientation_weight=0.01,
+        )
+    except Exception as e:
+        print(f"[IK] {e}")
+        return None
 
-        import subprocess
-        subprocess.Popen([
-            "python", "move_to_3d_location.py",
-            "--port", "/dev/ttyACM0",
-            "--id",   "my_lamp",
-            "--urdf-path", "/path/to/so100.urdf",
-            f"--target-x={x_m:.4f}",
-            f"--target-y={y_m:.4f}",
-            f"--target-z={z_m:.4f}",
-            "--duration", "3.0",
-        ])
-    """
-    pass   # ← plug arm call in here
+
+def build_action(joints, motor_names, home_last2):
+    """Build action dict: first N-2 joints from IK, last 2 locked to home."""
+    n = len(motor_names) - 2
+    action = {f"{motor_names[i]}.pos": float(joints[i]) for i in range(n)}
+    action[motor_names[-2] + ".pos"] = float(home_last2[0])
+    action[motor_names[-1] + ".pos"] = float(home_last2[1])
+    return action
+
+
+def find_urdf_auto():
+    candidates = [
+        Path.home() / "Documents/NYU/ITP/SO-ARM100/Simulation/SO100/so100.urdf",
+        Path.home() / "SO-ARM100/Simulation/SO100/so100.urdf",
+        Path.home() / "SO-ARM100-main/Simulation/SO100/so100.urdf",
+        Path("/opt/placo/models/so100/so100.urdf"),
+    ]
+    for p in candidates:
+        if p.exists():
+            print(f"[URDF] Found: {p}")
+            return str(p)
+    return "so100"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MAIN LOOP
+#  MAIN  (structure identical to main_v2.py, arm control added inline)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--webcam",  action="store_true",
-                        help="Force laptop webcam (/dev/video0)")
-    parser.add_argument("--camera", default=None,
-                        help="Device path, e.g. /dev/video2")
-    parser.add_argument("--detect-people", action="store_true",
-                        help="Also detect people in addition to objects")
+    parser.add_argument("--webcam",     action="store_true")
+    parser.add_argument("--camera",     default=None)
+    parser.add_argument("--port",       default=None,
+                        help="Serial port, e.g. /dev/ttyACM0")
+    parser.add_argument("--id",         default=None,
+                        help="Robot calibration ID, e.g. my_lamp")
+    parser.add_argument("--urdf-path",  default=None)
+    parser.add_argument("--calibration-dir", default=None)
+    parser.add_argument("--conf",       type=float, default=0.40)
+    parser.add_argument("--max-step",   type=float, default=0.02,
+                        help="Max EE movement per frame (m)")
+    parser.add_argument("--deadzone",   type=float, default=0.005,
+                        help="Min target shift to trigger move (m)")
+    parser.add_argument("--approach-z", type=float,
+                        default=GRIPPER_APPROACH_Z_OFFSET)
     args = parser.parse_args()
 
-    # Build target class list (same pattern as main.py v1)
     target_classes = list(OBJECT_WIDTHS_M.keys())
-    if args.detect_people:
-        target_classes.append("person")
 
-    # -- Load model -----------------------------------------------------------
+    # ── Model ─────────────────────────────────────────────────────────────────
     print(f"[INFO] Loading {MODEL_PATH} ...")
     model = YOLO(MODEL_PATH)
     yolo_class_ids = [cid for cid, name in model.names.items()
                       if name in target_classes]
     if yolo_class_ids:
         print(f"[INFO] Model ready -- tracking: {target_classes}")
-        print(f"[INFO] YOLO class IDs: {yolo_class_ids}")
     else:
-        print(f"[WARN] None of {target_classes} found in model class names!")
-        print(f"[WARN] Available classes (sample): "
-              f"{list(model.names.values())[:15]}")
         print("[WARN] Falling back to detecting ALL classes")
-        yolo_class_ids = None  # detect everything, filter in post-loop
+        yolo_class_ids = None
 
-    # ── Load calibrations ─────────────────────────────────────────────────────
+    # ── Calibrations ──────────────────────────────────────────────────────────
     cam_matrix, dist_coeffs, focal_px = load_camera_calibration()
     ws_polygon, homography, ws_m      = load_workspace_calibration()
 
-    # ── Pick camera ───────────────────────────────────────────────────────────
+    # ── Camera (identical to main_v2.py) ──────────────────────────────────────
     if args.camera is not None:
         cam_path   = args.camera
         robot_mode = True
@@ -316,8 +305,80 @@ def main():
     zoom = ZOOM_DEFAULT
 
     mode_label = "ROBOT CAM" if robot_mode else "WEBCAM"
-    print(f"\n[INFO] Running -- {mode_label} -- 'q' quit  '+'/'-' zoom\n")
 
+    # ── Arm setup (lazy — failure keeps vision running) ───────────────────────
+    arm_ok         = False
+    robot          = None
+    kinematics     = None
+    current_joints = None
+    motor_names    = None
+    initial_ee_rot = None
+    home_last2     = None
+
+    arm_requested = args.port is not None and args.id is not None
+    if arm_requested:
+        try:
+            from lerobot.model.kinematics import RobotKinematics
+            from lerobot.robots.so_follower import SO100Follower, SO100FollowerConfig
+
+            urdf_path = (str(Path(args.urdf_path).expanduser())
+                         if args.urdf_path else find_urdf_auto())
+            cal_dir   = (Path(args.calibration_dir).expanduser()
+                         if args.calibration_dir else None)
+
+            cfg = SO100FollowerConfig(
+                port=args.port,
+                id=args.id,
+                calibration_dir=cal_dir,
+                use_degrees=True,
+                max_relative_target=10.0,
+            )
+            robot = SO100Follower(cfg)
+            print(f"[ARM] Connecting on {args.port} ...")
+            robot.connect(calibrate=False)
+            print("[ARM] Connected.")
+
+            obs         = robot.get_observation()
+            motor_names = list(robot.bus.motors.keys())
+            current_joints = np.array(
+                [float(obs[f"{m}.pos"]) for m in motor_names
+                 if f"{m}.pos" in obs],
+                dtype=float,
+            )
+            print(f"[ARM] Joints: {current_joints}")
+
+            kinematics = RobotKinematics(
+                urdf_path=urdf_path,
+                target_frame_name="jaw",
+                joint_names=motor_names,
+            )
+            T0             = kinematics.forward_kinematics(current_joints)
+            initial_ee_rot = T0[:3, :3].copy()
+            home_last2     = current_joints[-2:].copy()  # wrist/gripper locked here
+            arm_ok         = True
+            print("[ARM] Ready.")
+            print(f"[ARM] Wrist/gripper locked at: {home_last2}")
+
+        except Exception as e:
+            print(f"[ARM] Setup failed: {e}")
+            print("[ARM] Vision-only mode.")
+            if robot is not None:
+                try:
+                    robot.disconnect()
+                except Exception:
+                    pass
+            robot = None
+    else:
+        print("[INFO] No --port/--id — vision-only mode.")
+
+    arm_label = "ARM OK" if arm_ok else ("ARM ERR" if arm_requested else "NO ARM")
+    print(f"\n[INFO] Running -- {mode_label} {arm_label} -- 'q' quit  '+'/'-' zoom\n")
+
+    joint_refresh_counter = 0
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  MAIN LOOP  (single-threaded, identical to main_v2.py)
+    # ══════════════════════════════════════════════════════════════════════════
     try:
         while True:
             ret, frame = cap.read()
@@ -330,12 +391,12 @@ def main():
             if cam_matrix is not None:
                 frame = cv2.undistort(frame, cam_matrix, dist_coeffs)
 
-            # ── YOLO inference ────────────────────────────────────────────────
+            # ── YOLO ──────────────────────────────────────────────────────────
             results = model.predict(
                 source=frame,
                 imgsz=max(fw, fh),
-                conf=CONFIDENCE_THRESH,
-                classes=yolo_class_ids,   # None = detect all, list = filter
+                conf=args.conf,
+                classes=yolo_class_ids,
                 verbose=False,
             )
 
@@ -346,8 +407,6 @@ def main():
             for result in results:
                 for box in result.boxes:
                     cls_name = model.names[int(box.cls)]
-                    # Post-filter: only keep target_classes
-                    # (handles case where yolo_class_ids fell back to None)
                     if cls_name not in target_classes:
                         continue
                     conf = float(box.conf)
@@ -356,64 +415,82 @@ def main():
                         best_box   = box.xyxy[0].cpu().numpy()
                         best_class = cls_name
 
-            # ── 3D coordinate computation ─────────────────────────────────────
-            target    = None   # dict with x_m, y_m, z_m if valid detection
-            inside    = False
+            # ── 3D coords ──────────────────────────────────────────────────────
+            target = None
+            inside = False
 
             if best_box is not None:
                 x1, y1, x2, y2 = best_box
-
-                # Centre of bounding box bottom edge — closest point to table
                 obj_px = (x1 + x2) / 2.0
-                obj_py = y2           # bottom of bbox → table contact point
+                obj_py = y2
 
                 inside = (ws_polygon is None or
                           is_inside_workspace(obj_px, obj_py, ws_polygon))
 
-                # Z: depth from camera → height above surface
                 z_from_cam = estimate_z(x2 - x1, best_class, focal_px)
 
                 if homography is not None:
-                    # Map bottom-centre pixel → real-world (X, Y) metres
                     x_m, y_m = pixel_to_world_xy(obj_px, obj_py, homography)
-                    # Z above the table: camera_height - object_depth ≈ 0 for
-                    # flat objects; we add an approach offset for the gripper
-                    z_m = GRIPPER_APPROACH_Z_OFFSET
+                    z_m = args.approach_z
                 else:
-                    # No workspace calibration — use raw depth as Z, no X/Y
                     x_m, y_m = float("nan"), float("nan")
                     z_m = z_from_cam
 
-                target = dict(x_m=x_m, y_m=y_m, z_m=z_m,
-                              z_depth=z_from_cam)
+                target = dict(x_m=x_m, y_m=y_m, z_m=z_m, z_depth=z_from_cam)
 
-                if inside:
-                    if not np.isnan(x_m):
-                        print(f"[TARGET] {best_class.upper()}  "
-                              f"conf={best_conf:.2f}  "
-                              f"X={x_m:.3f} m  Y={y_m:.3f} m  "
-                              f"Z={z_m:.3f} m  "
-                              f"(depth≈{z_from_cam:.2f} m)")
-                        print(f"         → move_to_3d_location.py "
-                              f"--target-x={x_m:.4f} "
-                              f"--target-y={y_m:.4f} "
-                              f"--target-z={z_m:.4f}")
+                if inside and not np.isnan(x_m):
+                    print(f"[TARGET] {best_class.upper()}  conf={best_conf:.2f}  "
+                          f"X={x_m:.3f} m  Y={y_m:.3f} m  Z={z_m:.3f} m")
+
+            # ── Arm control ────────────────────────────────────────────────────
+            if arm_ok:
+                # Periodically refresh joints from robot to prevent drift
+                joint_refresh_counter += 1
+                if joint_refresh_counter >= 30:
+                    joint_refresh_counter = 0
+                    try:
+                        obs = robot.get_observation()
+                        current_joints = np.array(
+                            [float(obs[f"{m}.pos"]) for m in motor_names
+                             if f"{m}.pos" in obs], dtype=float)
+                    except Exception:
+                        pass
+
+                if (target is not None and inside
+                        and not np.isnan(target["x_m"])):
+                    tgt = np.array([target["x_m"], target["y_m"], args.approach_z])
+                    ee  = get_current_ee_pos(kinematics, current_joints)
+                    d   = tgt - ee
+                    dist = np.linalg.norm(d)
+                    if dist > args.max_step:
+                        d = d / dist * args.max_step
+                    sol = ik_step(kinematics, current_joints, ee + d, initial_ee_rot)
+                    if sol is not None:
+                        # Singularity guard: skip if any joint jumps > 45 deg
+                        max_delta = float(np.max(np.abs(sol - current_joints)))
+                        if max_delta > 45.0:
+                            print(f"[IK] Singularity guard: {max_delta:.1f}deg jump — skipped.")
+                            robot.send_action(build_action(current_joints, motor_names, home_last2))
+                        else:
+                            robot.send_action(build_action(sol, motor_names, home_last2))
+                            current_joints = sol
+                            print(f"[TRACK] {best_class.upper()}  "
+                                  f"XY=({target['x_m']:.3f},{target['y_m']:.3f})m  "
+                                  f"EE=({ee[0]:.3f},{ee[1]:.3f},{ee[2]:.3f})m  "
+                                  f"dist={dist:.3f}m")
                     else:
-                        print(f"[TARGET] {best_class.upper()}  "
-                              f"conf={best_conf:.2f}  "
-                              f"depth≈{z_from_cam:.2f} m  "
-                              f"(no workspace calibration — X/Y unavailable)")
-                    send_to_arm(x_m, y_m, z_m)
+                        # IK failed — hold position
+                        robot.send_action(build_action(current_joints, motor_names, home_last2))
+                else:
+                    # No valid target — hold position
+                    robot.send_action(build_action(current_joints, motor_names, home_last2))
 
-            # ── Display ───────────────────────────────────────────────────────
+            # ── Display (identical to main_v2.py) ──────────────────────────────
             display = frame.copy()
 
-            # Workspace boundary
             if ws_polygon is not None:
                 cv2.polylines(display, [ws_polygon], isClosed=True,
                               color=(255, 200, 0), thickness=2)
-
-                # World-coordinate grid labels at polygon corners
                 if ws_m is not None:
                     corners_px = ws_polygon.reshape(-1, 2)
                     labels = ["(0,0)", f"({ws_m[0]:.2f},0)",
@@ -432,13 +509,11 @@ def main():
                               (int(x1), int(y1)), (int(x2), int(y2)),
                               box_color, 2)
 
-                # Label line 1: class + confidence
                 lbl1 = f"{best_class} {best_conf:.2f}"
                 cv2.putText(display, lbl1,
                             (int(x1), max(int(y1) - 20, 14)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 1)
 
-                # Label line 2: world coords
                 if target is not None and not np.isnan(target["x_m"]):
                     lbl2 = (f"X={target['x_m']:.3f}m  "
                             f"Y={target['y_m']:.3f}m  "
@@ -455,19 +530,17 @@ def main():
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                                 (0, 0, 220), 1)
 
-                # Cross-hair at bottom-centre (table contact point)
                 cx_px = int((x1 + x2) / 2)
                 cy_px = int(y2)
                 cv2.drawMarker(display, (cx_px, cy_px), box_color,
                                cv2.MARKER_CROSS, 12, 2)
 
-            # Mode / zoom HUD
+            arm_label = "ARM OK" if arm_ok else ("ARM ERR" if arm_requested else "NO ARM")
             cv2.putText(display,
-                        f"{mode_label}  zoom {zoom:.2f}x",
+                        f"{mode_label}  zoom {zoom:.2f}x  {arm_label}",
                         (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                         (0, 200, 255) if robot_mode else (100, 100, 255), 1)
 
-            # Calibration status
             cal_status = ("CAM+WS" if cam_matrix is not None and homography is not None
                           else "CAM only" if cam_matrix is not None
                           else "NO CALIB")
@@ -475,7 +548,7 @@ def main():
                         (fw - 80, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                         (0, 220, 120), 1)
 
-            cv2.imshow("LAMP V2", display)
+            cv2.imshow("LAMP — Track Object", display)
             key = cv2.waitKey(1) & 0xFF
 
             if key == ord("q"):
@@ -490,6 +563,13 @@ def main():
     finally:
         cap.release()
         cv2.destroyAllWindows()
+        if robot is not None:
+            try:
+                print("[ARM] Disconnecting ...")
+                robot.disconnect()
+                print("[ARM] Disconnected.")
+            except Exception:
+                pass
         print("[INFO] Done.")
 
 
