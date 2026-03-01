@@ -207,15 +207,22 @@ class DetectionThread(threading.Thread):
         self.bbox_point      = bbox_point      # "center", "top", or "bottom"
         self.max_target_jump = max_target_jump # metres; None = no limit
 
-        self._lock   = threading.Lock()
-        self._target = None    # (x_m, y_m, depth_m) or None
-        self._frame  = None    # latest annotated frame
-        self.running = True
+        self._lock        = threading.Lock()
+        self._target      = None    # (x_m, y_m, depth_m) or None — current frame
+        self._last_target = None    # last non-None target — for searching
+        self._frame       = None    # latest annotated frame
+        self.running      = True
 
     @property
     def target(self):
         with self._lock:
             return self._target
+
+    @property
+    def last_target(self):
+        """Last non-None target — persists after bottle disappears."""
+        with self._lock:
+            return self._last_target
 
     @property
     def latest_frame(self):
@@ -280,10 +287,12 @@ class DetectionThread(threading.Thread):
 
                 depth_m = estimate_depth(x2 - x1, self.focal_px)
 
-                if inside and self.homography is not None:
+                # Always compute world coords regardless of workspace boundary
+                # (inside is display-only — arm tracks the bottle everywhere)
+                if self.homography is not None:
                     x_m, y_m = pixel_to_world_xy(cx_px, cy_px, self.homography)
                     new_target = (x_m, y_m, depth_m)
-                elif inside:
+                else:
                     # No workspace calib -- use normalised pixel coords as proxy
                     new_target = (cx_px / CAM_WIDTH, cy_px / CAM_HEIGHT, depth_m)
 
@@ -324,10 +333,13 @@ class DetectionThread(threading.Thread):
 
             status = "TRACKING" if new_target is not None else "SEARCHING..."
             cv2.putText(display, status, (6, 18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 255), 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (0, 220, 0) if new_target is not None else (0, 200, 255), 1)
 
             with self._lock:
                 self._target = new_target
+                if new_target is not None:
+                    self._last_target = new_target
                 self._frame  = display
 
 
@@ -563,8 +575,30 @@ def main():
                     else:
                         robot.send_action(build_action(joints, motor_names, home_last2))
                 else:
-                    # No bottle detected -- hold position
-                    robot.send_action(build_action(joints, motor_names, home_last2))
+                    # No bottle detected -- keep moving toward last known target
+                    last_tgt = det.last_target
+                    if last_tgt is not None:
+                        x_m, y_m, _ = last_tgt
+                        if not (np.isnan(x_m) or np.isnan(y_m)):
+                            target_display = np.array([x_m, y_m, args.approach_z])
+                            ee_pos    = get_ee_pos(kinematics, joints)
+                            direction = target_display - ee_pos
+                            dist      = np.linalg.norm(direction)
+                            if dist > args.max_step:
+                                direction = direction / dist * args.max_step
+                            sol = ik_step(kinematics, joints,
+                                          ee_pos + direction,
+                                          initial_ee_rot, motor_names)
+                            if sol is not None:
+                                robot.send_action(build_action(sol, motor_names, home_last2))
+                                joints = sol
+                                print(f"[SEARCH] Moving toward last known position X={x_m:.3f} Y={y_m:.3f}")
+                            else:
+                                robot.send_action(build_action(joints, motor_names, home_last2))
+                        else:
+                            robot.send_action(build_action(joints, motor_names, home_last2))
+                    else:
+                        robot.send_action(build_action(joints, motor_names, home_last2))
 
             # -- Display (main thread only on Linux) ---------------------------
             if not args.no_window:
