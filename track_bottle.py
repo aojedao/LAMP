@@ -381,6 +381,22 @@ def build_action(joints, motor_names, home_last2):
     return action
 
 
+def go_home(robot, current_joints, home_joints, motor_names, steps=60, step_sleep=0.04):
+    """Linearly interpolate from current_joints back to home_joints, then hold."""
+    print("[ARM] Returning to home position ...")
+    for i in range(1, steps + 1):
+        t = i / steps
+        interp = current_joints + t * (home_joints - current_joints)
+        action = {f"{m}.pos": float(interp[j]) for j, m in enumerate(motor_names)}
+        try:
+            robot.send_action(action)
+        except Exception as e:
+            print(f"[ARM] go_home step {i} failed: {e}")
+            break
+        time.sleep(step_sleep)
+    print("[ARM] Home position reached.")
+
+
 def find_urdf():
     candidates = [
         Path.home() / "SO-ARM100-main/Simulation/SO100/so100.urdf",
@@ -432,6 +448,9 @@ def parse_args():
                    help="Run vision only, skip arm connection")
     p.add_argument("--no-window",   action="store_true",
                    help="Disable OpenCV display window")
+    p.add_argument("--track-interval", type=float, default=5.0,
+                   help="Seconds between bottle re-samples (arm moves continuously "
+                        "toward locked position between samples, default 5.0)")
     return p.parse_args()
 
 
@@ -484,6 +503,7 @@ def main():
     motor_names   = None
     initial_ee_rot = None
     home_last2     = None
+    home_joints    = None
 
     if use_arm:
         urdf_path = args.urdf_path or find_urdf()
@@ -518,6 +538,7 @@ def main():
         T0             = kinematics.forward_kinematics(joints)
         initial_ee_rot = T0[:3, :3].copy()
         home_last2     = joints[-2:].copy()  # wrist/gripper locked here
+        home_joints    = joints.copy()           # saved for return-to-home
         print("[ARM] Kinematics ready.")
         print(f"[ARM] Wrist/gripper locked at: {home_last2}")
 
@@ -527,13 +548,40 @@ def main():
     zoom                  = ZOOM_DEFAULT
     joint_refresh_counter = 0
 
-    print(f"\n[INFO] Tracking -- 'q' quit  '+'/'-' zoom  Ctrl+C stop\n")
+    # Interval-based target locking
+    locked_target      = None   # position sampled at last interval
+    last_sample_time   = 0.0    # time of last sample
+    track_interval     = args.track_interval
+
+    print(f"\n[INFO] Tracking -- bottle re-sampled every {track_interval:.1f}s")
+    print("       'q' quit  '+'/'-' zoom  Ctrl+C stop\n")
 
     try:
         while det.running:
             tick = time.perf_counter()
 
             tgt = det.target   # (x_m, y_m, depth_m) or None
+
+            # -- Interval-based target sampling --------------------------------
+            # Every track_interval seconds, snapshot the current bottle position.
+            # The arm then steps toward that locked position every tick until
+            # the next sample, giving it time to physically approach.
+            now = time.perf_counter()
+            if now - last_sample_time >= track_interval:
+                new_sample = tgt if tgt is not None else det.last_target
+                if new_sample is not None:
+                    locked_target    = new_sample
+                    last_sample_time = now
+                    print(f"[SAMPLE] New target locked: "
+                          f"X={locked_target[0]:.3f} Y={locked_target[1]:.3f}  "
+                          f"(next in {track_interval:.1f}s)")
+                else:
+                    # No bottle seen yet -- keep trying every tick
+                    last_sample_time = now
+                    print("[SAMPLE] No bottle visible -- retrying...")
+
+            # Use locked_target for arm motion this tick
+            active_tgt = locked_target
 
             # -- Arm control (main thread, IK step) ----------------------------
             if use_arm:
@@ -549,10 +597,16 @@ def main():
                     except Exception:
                         pass
 
-                if tgt is not None:
-                    x_m, y_m, _ = tgt
+                if active_tgt is not None:
+                    x_m, y_m, _ = active_tgt
                     if not (np.isnan(x_m) or np.isnan(y_m)):
-                        target_display = np.array([x_m, y_m, args.approach_z])
+                        # Map workspace coordinates → arm display frame:
+                        #   display X (forward) = y_m   (workspace depth, 0=near arm, max=far)
+                        #   display Y (left)    = x_m - ws_center  (0=centre, + is arm-left)
+                        ws_center = (ws_m[0] / 2.0) if ws_m is not None else 0.254
+                        disp_x = y_m
+                        disp_y = x_m - ws_center
+                        target_display = np.array([disp_x, disp_y, args.approach_z + 0.1])
                         ee_pos    = get_ee_pos(kinematics, joints)
                         direction = target_display - ee_pos
                         dist      = np.linalg.norm(direction)
@@ -564,41 +618,20 @@ def main():
                         if sol is not None:
                             robot.send_action(build_action(sol, motor_names, home_last2))
                             joints = sol
+                            label  = "TRACK" if tgt is not None else "APPROACH"
                             print(
-                                f"[TRACK] bottle X={x_m:.3f} Y={y_m:.3f}  "
+                                f"[{label}] ws=({x_m:.3f},{y_m:.3f})  "
+                                f"disp=({disp_x:.3f},{disp_y:.3f},{args.approach_z+0.1:.3f})  "
                                 f"EE=({ee_pos[0]:.3f},{ee_pos[1]:.3f},{ee_pos[2]:.3f})  "
                                 f"dist={dist:.3f}m"
                             )
                         else:
-                            # IK failed -- hold position
                             robot.send_action(build_action(joints, motor_names, home_last2))
                     else:
                         robot.send_action(build_action(joints, motor_names, home_last2))
                 else:
-                    # No bottle detected -- keep moving toward last known target
-                    last_tgt = det.last_target
-                    if last_tgt is not None:
-                        x_m, y_m, _ = last_tgt
-                        if not (np.isnan(x_m) or np.isnan(y_m)):
-                            target_display = np.array([x_m, y_m, args.approach_z])
-                            ee_pos    = get_ee_pos(kinematics, joints)
-                            direction = target_display - ee_pos
-                            dist      = np.linalg.norm(direction)
-                            if dist > args.max_step:
-                                direction = direction / dist * args.max_step
-                            sol = ik_step(kinematics, joints,
-                                          ee_pos + direction,
-                                          initial_ee_rot, motor_names)
-                            if sol is not None:
-                                robot.send_action(build_action(sol, motor_names, home_last2))
-                                joints = sol
-                                print(f"[SEARCH] Moving toward last known position X={x_m:.3f} Y={y_m:.3f}")
-                            else:
-                                robot.send_action(build_action(joints, motor_names, home_last2))
-                        else:
-                            robot.send_action(build_action(joints, motor_names, home_last2))
-                    else:
-                        robot.send_action(build_action(joints, motor_names, home_last2))
+                    # No target yet -- hold position
+                    robot.send_action(build_action(joints, motor_names, home_last2))
 
             # -- Display (main thread only on Linux) ---------------------------
             if not args.no_window:
@@ -611,6 +644,19 @@ def main():
                     cv2.putText(frame, label,
                                 (CAM_WIDTH - 210, 18),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 200, 255), 1)
+                    # Countdown to next sample
+                    time_since = now - last_sample_time
+                    countdown  = max(0.0, track_interval - time_since)
+                    tgt_color  = (0, 220, 0) if locked_target is not None else (0, 100, 220)
+                    cv2.putText(frame,
+                                f"next sample: {countdown:.1f}s",
+                                (6, CAM_HEIGHT - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.42, tgt_color, 1)
+                    if locked_target is not None:
+                        cv2.putText(frame,
+                                    f"locked X={locked_target[0]:.3f} Y={locked_target[1]:.3f}",
+                                    (6, CAM_HEIGHT - 24),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, tgt_color, 1)
                     cv2.imshow("LAMP Bottle Tracking", frame)
 
                 key = cv2.waitKey(1) & 0xFF
@@ -631,6 +677,8 @@ def main():
         cv2.destroyAllWindows()
 
         if robot is not None and robot.is_connected:
+            if home_joints is not None and joints is not None:
+                go_home(robot, joints, home_joints, motor_names)
             print("[ARM] Disconnecting ...")
             robot.disconnect()
             print("[ARM] Disconnected.")

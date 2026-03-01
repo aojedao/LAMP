@@ -354,6 +354,22 @@ def build_action(joints, motor_names, home_last2):
     return action
 
 
+def go_home(robot, current_joints, home_joints, motor_names, steps=60, step_sleep=0.04):
+    """Linearly interpolate from current_joints back to home_joints, then hold."""
+    print("[ARM] Returning to home position ...")
+    for i in range(1, steps + 1):
+        t = i / steps
+        interp = current_joints + t * (home_joints - current_joints)
+        action = {f"{m}.pos": float(interp[j]) for j, m in enumerate(motor_names)}
+        try:
+            robot.send_action(action)
+        except Exception as e:
+            print(f"[ARM] go_home step {i} failed: {e}")
+            break
+        time.sleep(step_sleep)
+    print("[ARM] Home position reached.")
+
+
 def find_urdf():
     candidates = [
         Path.home() / "SO-ARM100-main/Simulation/SO100/so100.urdf",
@@ -450,6 +466,7 @@ def main():
     motor_names    = None
     initial_ee_rot = None
     home_last2     = None
+    home_joints    = None
 
     if use_arm:
         urdf_path = (str(Path(args.urdf_path).expanduser())
@@ -485,6 +502,7 @@ def main():
         T0             = kinematics.forward_kinematics(joints)
         initial_ee_rot = T0[:3, :3].copy()
         home_last2     = joints[-2:].copy()
+        home_joints    = joints.copy()    # saved for return-to-home
         print(f"[ARM] Ready. Wrist/gripper locked at {home_last2}")
 
     # --------------------------------------------------------------------------
@@ -565,6 +583,8 @@ def main():
         cap.release()
         cv2.destroyAllWindows()
         if robot is not None and robot.is_connected:
+            if home_joints is not None and joints is not None:
+                go_home(robot, joints, home_joints, motor_names)
             print("[ARM] Disconnecting ...")
             robot.disconnect()
             print("[ARM] Disconnected.")
