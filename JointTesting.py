@@ -38,6 +38,8 @@ Tip:
     Start with a small amplitude and keep one hand near an emergency stop.
 """
 
+# Most of this code is referenced from phone_to_so100 teleoperate.py, but adapted for testing without a phone source.
+# Initial test of sending controls to the follower arm via code.
 
 import argparse
 import math
